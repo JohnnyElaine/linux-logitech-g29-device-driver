@@ -14,7 +14,6 @@ import subprocess
 import glob
 import re
 import time
-import argparse
 from pathlib import Path
 
 
@@ -209,50 +208,36 @@ def display_usb_devices(devices, filter_input=True):
     return devices
 
 
-def get_kernel_modules(directories=None):
+def get_kernel_modules(directory="."):
     """Get list of available kernel modules (.ko files)"""
-    if directories is None:
-        directories = ["."]
-
     modules = []
-    seen_modules = set()  # Track module names to avoid duplicates
 
-    # Search for .ko files in each specified directory
-    for directory in directories:
-        if not os.path.exists(directory):
-            print_warning(f"Directory not found: {directory}")
-            continue
+    # Search for .ko files in the specified directory
+    for ko_file in glob.glob(os.path.join(directory, "*.ko")):
+        module_name = os.path.basename(ko_file)
+        module_path = os.path.abspath(ko_file)
 
-        for ko_file in glob.glob(os.path.join(directory, "*.ko")):
-            module_name = os.path.basename(ko_file)
-            module_path = os.path.abspath(ko_file)
+        # Get module info if possible
+        try:
+            result = subprocess.run(['modinfo', module_path],
+                                  capture_output=True, text=True)
+            description = "No description"
+            for line in result.stdout.splitlines():
+                if line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+                    break
 
-            # Skip duplicates (same module name already found)
-            if module_name in seen_modules:
-                continue
-            seen_modules.add(module_name)
-
-            # Get module info if possible
-            try:
-                result = subprocess.run(['modinfo', module_path],
-                                    capture_output=True, text=True)
-                description = "No description"
-                for line in result.stdout.splitlines():
-                    if line.startswith("description:"):
-                        description = line.split(":", 1)[1].strip()
-                        break
-
-                modules.append({
-                    'name': module_name,
-                    'path': module_path,
-                    'description': description
-                })
-            except Exception:
-                modules.append({
-                    'name': module_name,
-                    'path': module_path,
-                    'description': "No description available"
-                })
+            modules.append({
+                'name': module_name,
+                'path': module_path,
+                'description': description
+            })
+        except Exception:
+            modules.append({
+                'name': module_name,
+                'path': module_path,
+                'description': "No description available"
+            })
 
     return modules
 
@@ -500,38 +485,8 @@ def unload_module(module):
         return False
 
 
-def is_module_loaded(module):
-    """Check if a kernel module is currently loaded"""
-    driver_name = get_module_driver_name(module)
-    try:
-        result = subprocess.run(['lsmod'], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if line.split()[0] == driver_name:
-                return True
-        return False
-    except Exception:
-        return False
-
-
 def main():
     """Main function"""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description='USB Driver Manager - CLI tool for managing USB device driver bindings',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Examples:\n'
-               '  sudo %(prog)s                          # Search for .ko files in current directory\n'
-               '  sudo %(prog)s /path/to/modules         # Search in specific directory\n'
-               '  sudo %(prog)s . /path/to/dir2          # Search in multiple directories\n'
-    )
-    parser.add_argument(
-        'directories',
-        nargs='*',
-        default=['.'],
-        help='Directories to search for kernel modules (.ko files). Defaults to current directory.'
-    )
-    args = parser.parse_args()
-
     print(f"{Colors.BOLD}{Colors.CYAN}")
     print("=" * 60)
     print("       USB Driver Manager")
@@ -570,9 +525,7 @@ def main():
             print(f"    {iface['name']}: class={iface['class']} subclass={iface['subclass']} protocol={iface['protocol']} driver={driver_color}{iface['driver']}{Colors.END}")
 
     # Step 3: List available kernel modules
-    if len(args.directories) > 1 or args.directories[0] != '.':
-        print(f"\nSearching for kernel modules in: {', '.join(args.directories)}")
-    modules = get_kernel_modules(args.directories)
+    modules = get_kernel_modules()
     displayed_modules = display_kernel_modules(modules)
 
     if not displayed_modules:
@@ -587,24 +540,14 @@ def main():
     selected_module = displayed_modules[module_idx]
     print(f"\n{Colors.CYAN}Selected module: {selected_module['name']}{Colors.END}")
 
-    # Check if module is already loaded
-    module_already_loaded = is_module_loaded(selected_module)
-    if module_already_loaded:
-        print_warning(f"Module {selected_module['name']} is already loaded and will be reloaded.")
-
     # Step 5: Confirm operation
     print(f"\n{Colors.YELLOW}This will:{Colors.END}")
     if selected_device.get('interfaces'):
         print(f"  1. Unbind interface(s) from current driver(s)")
     else:
         print(f"  1. Unbind {selected_device['name']} from {selected_device['driver']}")
-    if module_already_loaded:
-        print(f"  2. Unload existing module {selected_module['name']}")
-        print(f"  3. Load module {selected_module['name']} (fresh version)")
-        print(f"  4. Bind interface(s) to the new driver")
-    else:
-        print(f"  2. Load module {selected_module['name']}")
-        print(f"  3. Bind interface(s) to the new driver")
+    print(f"  2. Load module {selected_module['name']}")
+    print(f"  3. Bind interface(s) to the new driver")
 
     confirm = input(f"\n{Colors.BOLD}Proceed? (yes/no): {Colors.END}").strip().lower()
     if confirm not in ['yes', 'y']:
@@ -618,15 +561,6 @@ def main():
     if not unbind_device(selected_device):
         print_error("Failed to unbind device. Aborting.")
         sys.exit(1)
-
-    # Unload module if already loaded
-    if module_already_loaded:
-        if not unload_module(selected_module):
-            print_error("Failed to unload existing module.")
-            print_warning("You may need to manually unbind all devices using this driver first.")
-            sys.exit(1)
-        # Give kernel a moment after unloading
-        time.sleep(0.3)
 
     # Load new module
     if not load_module(selected_module):
