@@ -21,6 +21,9 @@
 #include <linux/usb.h>
 #include <linux/usb/input.h>
 #include <linux/input.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/hid.h>
 
 MODULE_AUTHOR("LLP group 16");
 MODULE_DESCRIPTION("Logitech G29 USB driver");
@@ -89,8 +92,25 @@ struct g29_dev {
 	int interval;
 	int endpoint;
 
+	struct timer_list steer_timer;
+	u32 steer_phase_ms;
+
 	struct g29_state last;
 };
+
+
+static void g29_steer_timer_fn(struct timer_list *t) {
+	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
+
+	const int rot = le16_to_cpu(g29->last.rot_le);
+
+	input_report_key(g29->input, KEY_W, g29->last.gas <= 0x80);
+	input_report_key(g29->input, KEY_S, g29->last.clt <= 0x80);
+	input_report_key(g29->input, KEY_A, rot <= 0x6000);
+	input_report_key(g29->input, KEY_D, rot >= 0xA000);
+
+	mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+}
 
 static void g29_apply_media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
 	u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
@@ -149,11 +169,14 @@ static int g29_input_open(struct input_dev *input) {
 	if (usb_submit_urb(g29->urb, GFP_KERNEL))
 		return -EIO;
 
+	mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+
 	return 0;
 }
 
 static void g29_input_close(struct input_dev *input) {
 	struct g29_dev *g29 = input_get_drvdata(input);
+	timer_delete_sync(&g29->steer_timer);
 	usb_kill_urb(g29->urb);
 }
 
@@ -194,6 +217,8 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	g29->interval = ep->bInterval;
 	memset(&g29->last, 0, sizeof(g29->last));
 
+	timer_setup(&g29->steer_timer, g29_steer_timer_fn, 0);
+
 	if ((g29->buf = usb_alloc_coherent(udev, g29->maxp, GFP_KERNEL, &g29->buf_dma)) == NULL) {
 		ret = -ENOMEM;
 		goto err_free_input;
@@ -233,6 +258,11 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	input_set_capability(input, EV_KEY, KEY_PLAYPAUSE);
 	input_set_capability(input, EV_KEY, KEY_NEXTSONG);
 	input_set_capability(input, EV_KEY, KEY_PREVIOUSSONG);
+
+	input_set_capability(input, EV_KEY, KEY_W);
+	input_set_capability(input, EV_KEY, KEY_A);
+	input_set_capability(input, EV_KEY, KEY_S);
+	input_set_capability(input, EV_KEY, KEY_D);
 
 	input_set_drvdata(input, g29);
 	input->open = g29_input_open;
