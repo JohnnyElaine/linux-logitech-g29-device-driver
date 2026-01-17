@@ -6,6 +6,11 @@ and binding USB devices to new drivers.
 
 Note: USB drivers typically bind to interfaces, not devices. This script
 handles both device-level and interface-level driver binding.
+
+Wheel-friendly improvements:
+  - Finds kernel modules (*.ko) recursively under provided directories (e.g. ./build).
+  - Lets the user select which USB interface(s) to unbind/bind.
+    Default selection: all HID interfaces (bInterfaceClass==03).
 """
 
 import os
@@ -74,7 +79,7 @@ def get_usb_devices():
         result = subprocess.run(['lsusb'], capture_output=True, text=True)
         for line in result.stdout.splitlines():
             # Format: Bus 001 Device 005: ID 046d:c52b Logitech, Inc. Unifying Receiver
-            match = re.match(r'Bus (\d+) Device (\d+): ID ([0-9a-f]{4}):([0-9a-f]{4})\s+(.*)', line)
+            match = re.match(r'Bus (\d+) Device (\d+): ID ([0-9a-f]{4}):([0-9a-f]{4})\s+(.*)', line, re.IGNORECASE)
             if match:
                 bus, dev, vendor, product, name = match.groups()
                 key = f"{int(bus)}-{int(dev)}"
@@ -93,7 +98,7 @@ def get_usb_devices():
 
         # Only process actual device entries (format: busnum-devnum or busnum-port.port...)
         device_name = device_path.name
-        if not re.match(r'\d+-[\d.]+', device_name):
+        if not re.match(r'\d+-[\d.]+$', device_name):
             continue
 
         # Skip root hubs
@@ -116,21 +121,9 @@ def get_usb_devices():
             if driver_link.exists() and driver_link.is_symlink():
                 driver = driver_link.resolve().name
 
-            # Try to get better name from lsusb
-            lsusb_key = f"{int(busnum)}-{int(devnum)}"
-            if lsusb_key in lsusb_output:
-                product = lsusb_output[lsusb_key]['name']
-
-            # Check if it's an input device by looking at device class or interfaces
-            is_input = False
-            device_class = (device_path / "bDeviceClass").read_text().strip() if (device_path / "bDeviceClass").exists() else "00"
-
-            # Class 03 is HID (Human Interface Device)
-            if device_class == "03":
-                is_input = True
-
             # Check interfaces for HID class and collect interface information
             interfaces = []
+            is_input = False
             for interface_path in device_path.glob("*:*.*"):
                 if not interface_path.is_dir():
                     continue
@@ -160,6 +153,12 @@ def get_usb_devices():
                 except Exception:
                     continue
 
+            # Improve product string from lsusb when possible (safe conversion)
+            if busnum.isdigit() and devnum.isdigit():
+                lsusb_key = f"{int(busnum)}-{int(devnum)}"
+                if lsusb_key in lsusb_output:
+                    product = lsusb_output[lsusb_key]['name']
+
             devices.append({
                 'path': str(device_path),
                 'name': device_name,
@@ -172,7 +171,7 @@ def get_usb_devices():
                 'driver': driver,
                 'is_input': is_input,
                 'interfaces': interfaces,
-                'display_name': f"{manufacturer} {product}"
+                'display_name': f"{manufacturer} {product}".strip()
             })
 
         except Exception as e:
@@ -217,42 +216,45 @@ def get_kernel_modules(directories=None):
     modules = []
     seen_modules = set()  # Track module names to avoid duplicates
 
-    # Search for .ko files in each specified directory
+    # Search for .ko files recursively in each specified directory
     for directory in directories:
         if not os.path.exists(directory):
             print_warning(f"Directory not found: {directory}")
             continue
 
-        for ko_file in glob.glob(os.path.join(directory, "*.ko")):
-            module_name = os.path.basename(ko_file)
-            module_path = os.path.abspath(ko_file)
+        for root, dirs, files in os.walk(directory):
+            for filename in files:
+                if not filename.endswith('.ko'):
+                    continue
 
-            # Skip duplicates (same module name already found)
-            if module_name in seen_modules:
-                continue
-            seen_modules.add(module_name)
+                module_name = filename
+                module_path = os.path.abspath(os.path.join(root, filename))
 
-            # Get module info if possible
-            try:
-                result = subprocess.run(['modinfo', module_path],
-                                    capture_output=True, text=True)
-                description = "No description"
-                for line in result.stdout.splitlines():
-                    if line.startswith("description:"):
-                        description = line.split(":", 1)[1].strip()
-                        break
+                # Skip duplicates (same module name already found)
+                if module_name in seen_modules:
+                    continue
+                seen_modules.add(module_name)
 
-                modules.append({
-                    'name': module_name,
-                    'path': module_path,
-                    'description': description
-                })
-            except Exception:
-                modules.append({
-                    'name': module_name,
-                    'path': module_path,
-                    'description': "No description available"
-                })
+                # Get module info if possible
+                try:
+                    result = subprocess.run(['modinfo', module_path], capture_output=True, text=True)
+                    description = "No description"
+                    for line in result.stdout.splitlines():
+                        if line.startswith("description:"):
+                            description = line.split(":", 1)[1].strip()
+                            break
+
+                    modules.append({
+                        'name': module_name,
+                        'path': module_path,
+                        'description': description
+                    })
+                except Exception:
+                    modules.append({
+                        'name': module_name,
+                        'path': module_path,
+                        'description': "No description available"
+                    })
 
     return modules
 
@@ -293,6 +295,55 @@ def get_user_choice(prompt, max_choice):
         except KeyboardInterrupt:
             print("\n")
             return None
+
+
+def get_interface_selection(device):
+    """Select which interface(s) to unbind/bind.
+
+    Default (Enter): all HID interfaces (class 03).
+    'a' selects all interfaces.
+    Comma-separated list selects specific interfaces.
+    """
+    if not device.get('interfaces'):
+        return []
+
+    print_header("Interfaces")
+    for idx, iface in enumerate(device['interfaces'], 1):
+        driver_color = Colors.GREEN if iface['driver'] != "none" else Colors.YELLOW
+        print(f"  {idx:>2}. {iface['name']}: class={iface['class']} subclass={iface['subclass']} protocol={iface['protocol']} driver={driver_color}{iface['driver']}{Colors.END}")
+
+    print("\nSelect interfaces to bind:")
+    print("  [Enter]  AUTO: all HID interfaces (class 03)")
+    print("  a        ALL interfaces")
+    print("  1,3      Comma-separated list")
+
+    raw = input("Selection: ").strip().lower()
+    if raw == "":
+        picked = [i for i in device['interfaces'] if i['class'] == "03"]
+        if not picked:
+            print_warning("No HID interfaces found; selecting ALL interfaces.")
+            picked = list(device['interfaces'])
+        return picked
+
+    if raw == "a":
+        return list(device['interfaces'])
+
+    picked = []
+    parts = [p.strip() for p in raw.split(',') if p.strip()]
+    for p in parts:
+        try:
+            i = int(p)
+            if 1 <= i <= len(device['interfaces']):
+                picked.append(device['interfaces'][i - 1])
+        except ValueError:
+            continue
+
+    if not picked:
+        print_warning("No valid interfaces selected; using AUTO (all HID interfaces).")
+        picked = [i for i in device['interfaces'] if i['class'] == "03"]
+        if not picked:
+            picked = list(device['interfaces'])
+    return picked
 
 
 def unbind_device(device, interface=None):
@@ -355,8 +406,7 @@ def load_module(module):
     """Load kernel module"""
     try:
         print(f"Loading module {module['name']}...")
-        result = subprocess.run(['insmod', module['path']],
-                              capture_output=True, text=True)
+        result = subprocess.run(['insmod', module['path']], capture_output=True, text=True)
         if result.returncode == 0:
             print_success(f"Successfully loaded {module['name']}")
             return True
@@ -435,7 +485,7 @@ def bind_device(device, module, interface=None):
             print_error(f"Failed to bind interface: {e}")
             return False
 
-    # Otherwise try to bind all HID mouse interfaces (class 03, subclass 01, protocol 02)
+    # Default behavior (kept for backwards compatibility): try boot mouse, then device.
     target_interfaces = []
     for iface in device.get('interfaces', []):
         # Look for HID Boot Mouse interfaces
@@ -482,13 +532,35 @@ def bind_device(device, module, interface=None):
     return success
 
 
+def bind_interface_to_driver(interface_name, driver_name):
+    """Bind a specific USB interface back to a given driver name (sysfs)."""
+    driver_path = Path(f"/sys/bus/usb/drivers/{driver_name}")
+    bind_path = driver_path / "bind"
+
+    if not driver_path.exists():
+        print_warning(f"Cannot restore: driver path not found: {driver_path}")
+        return False
+
+    if not bind_path.exists():
+        print_warning(f"Cannot restore: bind path not found: {bind_path}")
+        return False
+
+    try:
+        print(f"Restoring interface {interface_name} to driver {driver_name}...")
+        bind_path.write_text(interface_name)
+        print_success(f"Restored {interface_name} to {driver_name}")
+        return True
+    except Exception as e:
+        print_warning(f"Failed to restore interface {interface_name} to {driver_name}: {e}")
+        return False
+
+
 def unload_module(module):
     """Unload kernel module"""
     driver_name = get_module_driver_name(module)
     try:
         print(f"Unloading module {driver_name}...")
-        result = subprocess.run(['rmmod', driver_name],
-                              capture_output=True, text=True)
+        result = subprocess.run(['rmmod', driver_name], capture_output=True, text=True)
         if result.returncode == 0:
             print_success(f"Successfully unloaded {driver_name}")
             return True
@@ -562,12 +634,16 @@ def main():
     print(f"  Device: {selected_device['name']}")
     print(f"  Current driver: {selected_device['driver']}")
 
-    # Show interfaces
-    if selected_device.get('interfaces'):
-        print(f"\n  Interfaces:")
-        for iface in selected_device['interfaces']:
-            driver_color = Colors.GREEN if iface['driver'] != "none" else Colors.YELLOW
-            print(f"    {iface['name']}: class={iface['class']} subclass={iface['subclass']} protocol={iface['protocol']} driver={driver_color}{iface['driver']}{Colors.END}")
+    # Step 2b: Select interfaces
+    selected_interfaces = get_interface_selection(selected_device)
+    if not selected_interfaces:
+        print_warning("No interfaces available/selected; cannot bind.")
+        sys.exit(1)
+
+    # Remember original per-interface drivers for restore attempts
+    original_interface_drivers = {}
+    for iface in selected_interfaces:
+        original_interface_drivers[iface['name']] = iface.get('driver', 'none')
 
     # Step 3: List available kernel modules
     if len(args.directories) > 1 or args.directories[0] != '.':
@@ -594,17 +670,14 @@ def main():
 
     # Step 5: Confirm operation
     print(f"\n{Colors.YELLOW}This will:{Colors.END}")
-    if selected_device.get('interfaces'):
-        print(f"  1. Unbind interface(s) from current driver(s)")
-    else:
-        print(f"  1. Unbind {selected_device['name']} from {selected_device['driver']}")
+    print(f"  1. Unbind {len(selected_interfaces)} interface(s) from current driver(s)")
     if module_already_loaded:
         print(f"  2. Unload existing module {selected_module['name']}")
         print(f"  3. Load module {selected_module['name']} (fresh version)")
-        print(f"  4. Bind interface(s) to the new driver")
+        print(f"  4. Bind selected interface(s) to the new driver")
     else:
         print(f"  2. Load module {selected_module['name']}")
-        print(f"  3. Bind interface(s) to the new driver")
+        print(f"  3. Bind selected interface(s) to the new driver")
 
     confirm = input(f"\n{Colors.BOLD}Proceed? (yes/no): {Colors.END}").strip().lower()
     if confirm not in ['yes', 'y']:
@@ -614,10 +687,11 @@ def main():
     # Step 6: Perform operations
     print_header("\nExecuting operations...")
 
-    # Unbind from current driver
-    if not unbind_device(selected_device):
-        print_error("Failed to unbind device. Aborting.")
-        sys.exit(1)
+    # Unbind selected interfaces from current drivers
+    for iface in selected_interfaces:
+        if not unbind_device(selected_device, iface):
+            print_error("Failed to unbind interface. Aborting.")
+            sys.exit(1)
 
     # Unload module if already loaded
     if module_already_loaded:
@@ -631,24 +705,36 @@ def main():
     # Load new module
     if not load_module(selected_module):
         print_error("Failed to load module. Attempting to restore...")
-        # Try to rebind to original driver if available
-        if selected_device['driver'] != "none":
-            bind_device(selected_device, {'name': selected_device['driver'] + '.ko'})
+        # Try to rebind each selected interface to its original driver
+        for iface in selected_interfaces:
+            orig = original_interface_drivers.get(iface['name'], 'none')
+            if orig != 'none':
+                bind_interface_to_driver(iface['name'], orig)
         sys.exit(1)
 
     # Give kernel time to auto-probe and bind
     print("Waiting for kernel to probe interfaces...")
     time.sleep(0.5)
 
-    # Bind to new driver
-    if not bind_device(selected_device, selected_module):
-        print_error("Failed to bind device to new driver.")
-        print_warning("Device may be unbound. You might need to reconnect it or bind manually.")
+    # Bind selected interfaces to new driver
+    bound_any = False
+    for iface in selected_interfaces:
+        if bind_device(selected_device, selected_module, iface):
+            bound_any = True
+        else:
+            # Restore interfaces that failed to bind to the new driver
+            orig = original_interface_drivers.get(iface['name'], 'none')
+            if orig != 'none':
+                bind_interface_to_driver(iface['name'], orig)
+
+    if not bound_any:
+        print_error("Failed to bind any interface to the new driver.")
+        print_warning("All selected interfaces were restored where possible. You might need to reconnect the device.")
         sys.exit(1)
 
     # Success
     print_header("\nOperation completed successfully!")
-    print(f"{Colors.GREEN}Device {selected_device['name']} is now using the new driver{Colors.END}")
+    print(f"{Colors.GREEN}Device {selected_device['name']} interface(s) are now using the new driver{Colors.END}")
 
     # Offer to show new device status
     print("\nVerifying device status...")

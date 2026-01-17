@@ -1,54 +1,62 @@
+# Device Drivers
+----------------------------------
 
-Device Driver
-======================
+This repository contains Linux **kernel modules** (``.ko``) that implement low-level USB input drivers and expose device events through the Linux **input subsystem** (evdev).
 
-A collection of USB device drivers for Linux kernel, demonstrating how to interact with various USB HID devices.
+A helper tool (``usb_driver_manager.py``) is included to make it easier to:
+- list USB devices and their **interfaces**
+- load/unload (reload) a chosen ``.ko`` module
+- unbind/bind a selected interface to a chosen driver during development
 
-## Current Drivers
+## Drivers
+----------
 
-### Mouse Driver (`mouse/`)
-A USB HID mouse driver that supports 16-bit coordinate tracking for high-DPI gaming mice. Tested with Cooler Master MM710.
+### Mouse driver (``mouse/``)
+USB HID boot-protocol mouse driver.
 
-**Features:**
-- Left, right, middle, side, and extra button support
-- 16-bit X/Y movement (high-speed tracking)
-- Scroll wheel support
-- Binds to HID Boot Protocol Mouse interfaces
-
-**Building:**
+**Build:**
 ```bash
-cd mouse/
+cd mouse
 make
 ```
 
-## USB Driver Manager
+### Logitech G29 media driver (``g29_media_usb/``)
+Logitech G29 driver that maps selected wheel inputs to media key events.
 
-The `usb_driver_manager.py` tool simplifies the process of binding USB devices to custom drivers.
+**Current mapping (Mode 0):**
+- Red rotary clockwise / counter-clockwise  -> Volume Up / Volume Down
+- Return ("Enter")                          -> Play/Pause
+- Plus / Minus                              -> Next track / Previous track
 
-**Usage:**
+**Build:**
 ```bash
-# Search for .ko files in current directory
-sudo python3 usb_driver_manager.py
-
-# Search in specific directories
-sudo python3 usb_driver_manager.py ./mouse ./keyboard
-
-# The tool will:
-# 1. List available USB HID devices
-# 2. Show available kernel modules (.ko files)
-# 3. Unbind the device from its current driver
-# 4. Unload existing module (if already loaded)
-# 5. Load the new module
-# 6. Bind the device to the new driver
+cd g29_media_usb
+make
 ```
 
-## Future Drivers
+After building, the module (``*.ko``) is typically placed under ``build/`` by the provided Makefiles.
 
-- **Keyboard**: USB HID keyboard driver
-- **Racing Wheel**: USB racing wheel driver with force feedback
+## USB Driver Manager
+---------------------
 
-## Requirements
+**Usage examples:**
+```bash
+# Search for modules in these driver directories (the tool searches recursively)
+sudo python3 usb_driver_manager.py ./mouse ./g29_media_usb
 
-- Linux kernel headers
-- Python 3.6+
-- Root/sudo access for driver loading and binding
+# Or point directly at build/ directories
+sudo python3 usb_driver_manager.py ./mouse/build ./g29_media_usb/build
+```
+
+**Workflow:**
+1. Select the USB device.
+2. (Optional but recommended for non-mouse devices) select the USB **interface** to bind.
+3. Select the kernel module.
+4. Confirm; the tool unbinds the current driver, reloads the module if needed, and binds the chosen interface.
+
+## Testing
+----------
+After binding the driver, use ``evtest`` to confirm key events:
+```bash
+sudo evtest
+```
