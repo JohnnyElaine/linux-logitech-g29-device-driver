@@ -95,19 +95,50 @@ struct g29_dev {
 	struct timer_list steer_timer;
 	u32 steer_phase_ms;
 
+	u32 phase_accumulator;  /* Phase accumulator for PWM-like key pressing */
+
 	struct g29_state last;
 };
 
+#define WHEEL_CENTER 32768
+#define WHEEL_MAX_DIST 32768
 
 static void g29_steer_timer_fn(struct timer_list *t) {
 	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
 
 	const int rot = le16_to_cpu(g29->last.rot_le);
+	int distance_from_center = abs(rot - WHEEL_CENTER);
+	int target_key = (rot < WHEEL_CENTER) ? KEY_A : KEY_D;
+	bool press_key;
 
+	/* Phase accumulator approach:
+	 * Accumulate the distance on each tick.
+	 * When it exceeds the max distance, press the key and wrap.
+	 * This gives us a duty cycle of (distance / WHEEL_MAX_DIST).
+	 *
+	 * Examples:
+	 *   distance = WHEEL_MAX_DIST/2 (50%) -> press every 2nd tick
+	 *   distance = WHEEL_MAX_DIST (100%)   -> press every tick
+	 *   distance = WHEEL_MAX_DIST/4 (25%)  -> press every 4th tick
+	 */
+	g29->phase_accumulator += distance_from_center;
+
+	if (g29->phase_accumulator >= WHEEL_MAX_DIST) {
+		g29->phase_accumulator -= WHEEL_MAX_DIST;
+		press_key = true;
+	} else {
+		press_key = false;
+	}
+
+	/* Report the appropriate horizontal key */
+	input_report_key(g29->input, KEY_A, press_key && (rot < WHEEL_CENTER));
+	input_report_key(g29->input, KEY_D, press_key && (rot >= WHEEL_CENTER));
+
+	/* Gas/clutch to W/S (note: 0xFF is unpressed, 0x00 is fully pressed) */
 	input_report_key(g29->input, KEY_W, g29->last.gas <= 0x80);
 	input_report_key(g29->input, KEY_S, g29->last.clt <= 0x80);
-	input_report_key(g29->input, KEY_A, rot <= 0x6000);
-	input_report_key(g29->input, KEY_D, rot >= 0xA000);
+
+	input_sync(g29->input);
 
 	mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
 }
