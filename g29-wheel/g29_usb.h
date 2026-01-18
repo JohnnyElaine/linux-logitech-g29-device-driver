@@ -35,6 +35,7 @@
 #define G29_BTN_RED_CW      0x02000000u
 #define G29_BTN_RED_CCW     0x04000000u
 #define G29_BTN_RETURN      0x08000000u
+#define G29_BTN_PS3_LOGO     0xF0000000u
 
 #define G29_DPAD_MASK       0x0000000Eu
 #define G29_DPAD_UP         0x00000000u

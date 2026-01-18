@@ -39,6 +39,13 @@ static int mode = G29_MODE_MEDIA;
 module_param(mode, int, 0444);
 MODULE_PARM_DESC(mode, "Mapping mode (0=MEDIA)");
 
+/* Steering curve exponent (100 = linear, 200 = squared, 150 = ^1.5)
+ * Higher values reduce sensitivity at low steering angles.
+ */
+static int steer_curve = 200;
+module_param(steer_curve, int, 0644);
+MODULE_PARM_DESC(steer_curve, "Steering sensitivity curve (100=linear, 200=squared, default=200)");
+
 struct g29_keymap_edge {
 	u32 mask;
 	unsigned short keycode;
@@ -85,21 +92,59 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
 
 	const int rot = le16_to_cpu(g29->last.rot_le);
-	int distance_from_center = abs(rot - WHEEL_CENTER);
-	bool press_key;
+	int distance_to_center = abs(rot - WHEEL_CENTER);
+	int adjusted_distance;
+
+	//pr_info("g29: rot=%d distance_to_center=%d\n", rot, distance_to_center);
+
+	/* Apply non-linear steering curve:
+	 * adjusted = (distance / MAX)^(curve/100) * MAX
+	 *
+	 * For curve=200 (squared): 5% input -> 0.25% output, 50% -> 25%, 100% -> 100%
+	 * For curve=150 (^1.5):    5% input -> ~1.1% output, 50% -> ~35%, 100% -> 100%
+	 * For curve=100 (linear):  5% input -> 5% output (no change)
+	 *
+	 * Using integer math: adjusted = (distance^2 / MAX) for curve=200
+	 */
+	if (steer_curve == 100) {
+		/* Linear response - no adjustment */
+		adjusted_distance = distance_to_center;
+	} else if (steer_curve == 200) {
+		/* Squared response - optimized integer calculation */
+		adjusted_distance = (distance_to_center * distance_to_center) / WHEEL_MAX_DIST;
+	} else {
+		/* Generic power curve using normalized values (0-1000 range for precision)
+		 * normalized = (distance * 1000) / WHEEL_MAX_DIST
+		 * Apply power approximation, then scale back
+		 */
+		int normalized = (distance_to_center * 1000) / WHEEL_MAX_DIST;
+		int powered;
+		
+		if (steer_curve == 150) {
+			/* Approximate ^1.5 with (x * sqrt(x)) */
+			int sqrt_norm = int_sqrt(normalized * 1000);
+			powered = (normalized * sqrt_norm) / 1000;
+		} else {
+			/* Fallback: squared for any other value > 100 */
+			powered = (normalized * normalized) / 1000;
+		}
+		
+		adjusted_distance = (powered * WHEEL_MAX_DIST) / 1000;
+	}
 
 	/* Phase accumulator approach:
-	 * Accumulate the distance on each tick.
+	 * Accumulate the adjusted distance on each tick.
 	 * When it exceeds the max distance, press the key and wrap.
-	 * This gives us a duty cycle of (distance / WHEEL_MAX_DIST).
+	 * This gives us a duty cycle of (adjusted_distance / WHEEL_MAX_DIST).
 	 *
-	 * Examples:
-	 *   distance = WHEEL_MAX_DIST/2 (50%) -> press every 2nd tick
-	 *   distance = WHEEL_MAX_DIST (100%)   -> press every tick
-	 *   distance = WHEEL_MAX_DIST/4 (25%)  -> press every 4th tick
+	 * Examples (with curve=200):
+	 *   5% steering  -> ~0.25% press rate
+	 *   50% steering -> 25% press rate
+	 *   100% steering -> 100% press rate (every tick)
 	 */
-	g29->phase_accumulator += distance_from_center;
+	g29->phase_accumulator += adjusted_distance;
 
+	bool press_key;
 	if (g29->phase_accumulator >= WHEEL_MAX_DIST) {
 		g29->phase_accumulator -= WHEEL_MAX_DIST;
 		press_key = true;
