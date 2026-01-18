@@ -33,11 +33,13 @@ MODULE_LICENSE("GPL");
 
 enum g29_mode {
 	G29_MODE_MEDIA = 0,
+	G29_MODE_WASD = 1,
+	G29_MODE_MOUSE = 2,
 };
 
 static int mode = G29_MODE_MEDIA;
-module_param(mode, int, 0444);
-MODULE_PARM_DESC(mode, "Mapping mode (0=MEDIA)");
+module_param(mode, int, 0644);
+MODULE_PARM_DESC(mode, "Initial mode (0=MEDIA, 1=WASD, 2=MOUSE)");
 
 /* Steering curve exponent (100 = linear, 200 = squared, 150 = ^1.5)
  * Higher values reduce sensitivity at low steering angles.
@@ -45,6 +47,10 @@ MODULE_PARM_DESC(mode, "Mapping mode (0=MEDIA)");
 static int steer_curve = 200;
 module_param(steer_curve, int, 0644);
 MODULE_PARM_DESC(steer_curve, "Steering sensitivity curve (100=linear, 200=squared, default=200)");
+
+static int steer_deadzone = 10;
+module_param(steer_deadzone, int, 0644);
+MODULE_PARM_DESC(steer_deadzone, "Steering deadzone radius from center (default=10)");
 
 struct g29_keymap_edge {
 	u32 mask;
@@ -81,22 +87,37 @@ struct g29_dev {
 	struct timer_list steer_timer;
 	u32 steer_phase_ms;
 
-	u32 phase_accumulator;  /* Phase accumulator for PWM-like key pressing */
+	u32 phase_accumulator;
 
+	enum g29_mode current_mode;
 	struct g29_state last;
 };
 
 
 
-static void g29_steer_timer_fn(struct timer_list *t) {
-	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
+static void g29_switch_mode(struct g29_dev *g29, enum g29_mode new_mode) {
+	if (g29->current_mode == new_mode)
+		return;
 
-	const int rot = le16_to_cpu(g29->last.rot_le);
-	int distance_to_center = abs(rot - WHEEL_CENTER);
-	int adjusted_distance;
+	/* Stop timer when leaving WASD mode */
+	if (g29->current_mode == G29_MODE_WASD) {
+		timer_delete_sync(&g29->steer_timer);
+	}
 
-	//pr_info("g29: rot=%d distance_to_center=%d\n", rot, distance_to_center);
+	g29->current_mode = new_mode;
+	g29->phase_accumulator = 0;  /* Reset accumulator */
 
+	/* Start timer when entering WASD mode */
+	if (new_mode == G29_MODE_WASD) {
+		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+	}
+
+	dev_info(&g29->udev->dev, "Switched to mode: %s\n",
+		 new_mode == G29_MODE_MEDIA ? "MEDIA" :
+		 new_mode == G29_MODE_WASD ? "WASD" : "MOUSE");
+}
+
+static int calc_adjusted_distance(int distance) {
 	/* Apply non-linear steering curve:
 	 * adjusted = (distance / MAX)^(curve/100) * MAX
 	 *
@@ -107,30 +128,45 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 	 * Using integer math: adjusted = (distance^2 / MAX) for curve=200
 	 */
 	if (steer_curve == 100) {
-		/* Linear response - no adjustment */
-		adjusted_distance = distance_to_center;
-	} else if (steer_curve == 200) {
-		/* Squared response - optimized integer calculation */
-		adjusted_distance = (distance_to_center * distance_to_center) / WHEEL_MAX_DIST;
-	} else {
-		/* Generic power curve using normalized values (0-1000 range for precision)
-		 * normalized = (distance * 1000) / WHEEL_MAX_DIST
-		 * Apply power approximation, then scale back
-		 */
-		int normalized = (distance_to_center * 1000) / WHEEL_MAX_DIST;
-		int powered;
-		
-		if (steer_curve == 150) {
-			/* Approximate ^1.5 with (x * sqrt(x)) */
-			int sqrt_norm = int_sqrt(normalized * 1000);
-			powered = (normalized * sqrt_norm) / 1000;
-		} else {
-			/* Fallback: squared for any other value > 100 */
-			powered = (normalized * normalized) / 1000;
-		}
-		
-		adjusted_distance = (powered * WHEEL_MAX_DIST) / 1000;
+		return distance;
 	}
+	if (steer_curve == 200) {
+		return(distance * distance) / WHEEL_MAX_DIST;
+	}
+
+	/* Generic power curve using normalized values (0-1000 range for precision)
+	 * normalized = (distance * 1000) / WHEEL_MAX_DIST
+	 * Apply power approximation, then scale back
+	 */
+	int normalized = (distance * 1000) / WHEEL_MAX_DIST;
+	int powered;
+
+	if (steer_curve == 150) {
+		/* Approximate ^1.5 with (x * sqrt(x)) */
+		int sqrt_norm = int_sqrt(normalized * 1000);
+		powered = (normalized * sqrt_norm) / 1000;
+	} else {
+		/* Fallback: squared for any other value > 100 */
+		powered = (normalized * normalized) / 1000;
+	}
+
+	return (powered * WHEEL_MAX_DIST) / 1000;
+}
+
+static void g29_steer_timer_fn(struct timer_list *t) {
+	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
+
+	const int rot = le16_to_cpu(g29->last.rot_le);
+	
+	/* Apply deadzone */
+	int effective_rot = rot;
+	int distance_from_center = abs(rot - WHEEL_CENTER);
+	if (distance_from_center <= steer_deadzone) {
+		effective_rot = WHEEL_CENTER;
+	}
+	
+	int distance_to_center = abs(effective_rot - WHEEL_CENTER);
+	int adjusted_distance = calc_adjusted_distance(distance_to_center);
 
 	/* Phase accumulator approach:
 	 * Accumulate the adjusted distance on each tick.
@@ -152,20 +188,19 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 		press_key = false;
 	}
 
-	/* Report the appropriate horizontal key */
-	input_report_key(g29->input, KEY_A, press_key && (rot < WHEEL_CENTER));
-	input_report_key(g29->input, KEY_D, press_key && (rot >= WHEEL_CENTER));
+	input_report_key(g29->input, KEY_A, press_key && (effective_rot < WHEEL_CENTER));
+	input_report_key(g29->input, KEY_D, press_key && (effective_rot >= WHEEL_CENTER));
 
-	/* Gas/clutch to W/S (note: 0xFF is unpressed, 0x00 is fully pressed) */
 	input_report_key(g29->input, KEY_W, g29->last.gas <= 0x80);
 	input_report_key(g29->input, KEY_S, g29->last.clt <= 0x80);
 
 	input_sync(g29->input);
 
-	mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+	if (g29->current_mode == G29_MODE_WASD)
+		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
 }
 
-static void g29_apply_media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+static void media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
 	u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
 	for (int i = 0; i < ARRAY_SIZE(g29_media_edge_map); i++) {
 		const struct g29_keymap_edge *e = &g29_media_edge_map[i];
@@ -174,18 +209,87 @@ static void g29_apply_media_mode(struct g29_dev *g29, const struct g29_state *cu
 			input_report_key(g29->input, e->keycode, 0);
 		}
 	}
-
 	input_sync(g29->input);
+}
+
+static void wasd_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+	/* WASD mode is handled by the timer function (g29_steer_timer_fn) */
+	/* No additional processing needed here */
+}
+
+static void mouse_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+	/* Translate wheel rotation to mouse X movement */
+	int rot = le16_to_cpu(cur->rot_le);
+	int prev_rot = le16_to_cpu(prev->rot_le);
+	
+	/* Apply deadzone to both current and previous */
+	if (abs(rot - WHEEL_CENTER) <= steer_deadzone) {
+		rot = WHEEL_CENTER;
+	}
+	if (abs(prev_rot - WHEEL_CENTER) <= steer_deadzone) {
+		prev_rot = WHEEL_CENTER;
+	}
+	
+	int delta = rot - prev_rot;
+	
+	/* Handle wrap-around (0xFFFF -> 0x0000 or vice versa) */
+	if (delta > 32768)
+		delta -= 65536;
+	else if (delta < -32768)
+		delta += 65536;
+	
+	/* Scale movement (adjust sensitivity) */
+	if (delta != 0) {
+		input_report_rel(g29->input, REL_X, delta / 100);
+	}
+	
+	/* Gas pedal -> scroll up, Brake pedal -> scroll down */
+	if (cur->gas < 0x80 && prev->gas >= 0x80) {
+		input_report_rel(g29->input, REL_WHEEL, 1);
+	}
+	if (cur->brk < 0x80 && prev->brk >= 0x80) {
+		input_report_rel(g29->input, REL_WHEEL, -1);
+	}
+	
+	/* Map buttons to mouse buttons */
+	u32 cur_buttons = le32_to_cpu(cur->buttons_le);
+	u32 prev_buttons = le32_to_cpu(prev->buttons_le);
+	
+	input_report_key(g29->input, BTN_LEFT, cur_buttons & G29_BTN_X);
+	input_report_key(g29->input, BTN_RIGHT, cur_buttons & G29_BTN_CIRCLE);
+	input_report_key(g29->input, BTN_MIDDLE, cur_buttons & G29_BTN_SQUARE);
+	
+	input_sync(g29->input);
+}
+
+static void g29_check_mode_switch(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+	u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
+	
+	if (pressed & G29_BTN_SHARE) {
+		g29_switch_mode(g29, G29_MODE_MEDIA);
+	} else if (pressed & G29_BTN_OPTION) {
+		g29_switch_mode(g29, G29_MODE_WASD);
+	} else if (pressed & G29_BTN_PS3_LOGO) {
+		g29_switch_mode(g29, G29_MODE_MOUSE);
+	}
 }
 
 static void g29_process_report(struct g29_dev *g29, const u8 *data, unsigned int len) {
 	if (len < 12) return;
 
 	struct g29_state *cur = (void *) data;
-	switch (mode) {
+	
+	g29_check_mode_switch(g29, cur, &g29->last);
+	
+	switch (g29->current_mode) {
 		case G29_MODE_MEDIA:
-		default:
-			g29_apply_media_mode(g29, cur, &g29->last);
+			media_mode(g29, cur, &g29->last);
+			break;
+		case G29_MODE_WASD:
+			wasd_mode(g29, cur, &g29->last);
+			break;
+		case G29_MODE_MOUSE:
+			mouse_mode(g29, cur, &g29->last);
 			break;
 	}
 
@@ -222,14 +326,17 @@ static int g29_input_open(struct input_dev *input) {
 	if (usb_submit_urb(g29->urb, GFP_KERNEL))
 		return -EIO;
 
-	mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+	g29_switch_mode(g29, mode);
 
 	return 0;
 }
 
 static void g29_input_close(struct input_dev *input) {
 	struct g29_dev *g29 = input_get_drvdata(input);
-	timer_delete_sync(&g29->steer_timer);
+	
+	if (g29->current_mode == G29_MODE_WASD)
+		timer_delete_sync(&g29->steer_timer);
+	
 	usb_kill_urb(g29->urb);
 }
 
@@ -269,6 +376,7 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	g29->maxp = usb_endpoint_maxp(ep);
 	g29->interval = ep->bInterval;
 	memset(&g29->last, 0, sizeof(g29->last));
+	g29->current_mode = mode;  /* Initialize to module parameter */
 
 	timer_setup(&g29->steer_timer, g29_steer_timer_fn, 0);
 
@@ -304,18 +412,28 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	input->dev.parent = &intf->dev;
 
 	__set_bit(EV_KEY, input->evbit);
+	__set_bit(EV_REL, input->evbit);
 
-	/* Advertise only the keys we emit in media mode. */
+	/* Media mode keys */
 	input_set_capability(input, EV_KEY, KEY_VOLUMEUP);
 	input_set_capability(input, EV_KEY, KEY_VOLUMEDOWN);
 	input_set_capability(input, EV_KEY, KEY_PLAYPAUSE);
 	input_set_capability(input, EV_KEY, KEY_NEXTSONG);
 	input_set_capability(input, EV_KEY, KEY_PREVIOUSSONG);
 
+	/* WASD mode keys */
 	input_set_capability(input, EV_KEY, KEY_W);
 	input_set_capability(input, EV_KEY, KEY_A);
 	input_set_capability(input, EV_KEY, KEY_S);
 	input_set_capability(input, EV_KEY, KEY_D);
+
+	/* Mouse mode capabilities */
+	input_set_capability(input, EV_KEY, BTN_LEFT);
+	input_set_capability(input, EV_KEY, BTN_RIGHT);
+	input_set_capability(input, EV_KEY, BTN_MIDDLE);
+	input_set_capability(input, EV_REL, REL_X);
+	input_set_capability(input, EV_REL, REL_Y);
+	input_set_capability(input, EV_REL, REL_WHEEL);
 
 	input_set_drvdata(input, g29);
 	input->open = g29_input_open;
