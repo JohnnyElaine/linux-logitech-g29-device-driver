@@ -41,6 +41,9 @@ MODULE_LICENSE("GPL");
 #define G29_BTN_R1          0x00000100u
 #define G29_BTN_L1          0x00000200u
 
+#define WHEEL_CENTER 32768
+#define WHEEL_MAX_DIST 32768
+
 enum g29_mode {
 	G29_MODE_MEDIA = 0,
 };
@@ -100,15 +103,13 @@ struct g29_dev {
 	struct g29_state last;
 };
 
-#define WHEEL_CENTER 32768
-#define WHEEL_MAX_DIST 32768
+
 
 static void g29_steer_timer_fn(struct timer_list *t) {
 	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
 
 	const int rot = le16_to_cpu(g29->last.rot_le);
 	int distance_from_center = abs(rot - WHEEL_CENTER);
-	int target_key = (rot < WHEEL_CENTER) ? KEY_A : KEY_D;
 	bool press_key;
 
 	/* Phase accumulator approach:
@@ -161,10 +162,10 @@ static void g29_process_report(struct g29_dev *g29, const u8 *data, unsigned int
 
 	struct g29_state *cur = (void *) data;
 	switch (mode) {
-	case G29_MODE_MEDIA:
-	default:
-		g29_apply_media_mode(g29, cur, &g29->last);
-		break;
+		case G29_MODE_MEDIA:
+		default:
+			g29_apply_media_mode(g29, cur, &g29->last);
+			break;
 	}
 
 	g29->last = *cur;
