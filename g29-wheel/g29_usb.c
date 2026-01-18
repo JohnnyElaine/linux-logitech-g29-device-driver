@@ -220,10 +220,10 @@ static void mouse_mode_timer_fn(struct timer_list *t) {
 	
 	/* Calculate angle from wheel rotation
 	 * Map wheel rotation to angle: 
-	 * - Center (32768) = 0° (straight up when forward)
-	 * - Full left (0) = -90° (left)
-	 * - Full right (65535) = +90° (right)
-	 * We normalize to -1000 to +1000 for integer math
+	 * - Center (32768) = 0° (straight forward)
+	 * - Full left (0) = -180° (reverse)
+	 * - Full right (65535) = +180° (reverse)
+	 * We normalize to -1000 to +1000 representing -π to +π radians
 	 */
 	int angle_normalized = ((effective_rot - WHEEL_CENTER) * 1000) / WHEEL_CENTER;
 	
@@ -231,18 +231,24 @@ static void mouse_mode_timer_fn(struct timer_list *t) {
 	if (angle_normalized > 1000) angle_normalized = 1000;
 	if (angle_normalized < -1000) angle_normalized = -1000;
 	
-	/* Calculate movement components:
+	/* Calculate movement components using better trigonometric approximations:
 	 * dx = sin(angle) * speed
 	 * dy = cos(angle) * speed
 	 * 
-	 * For small angles we approximate:
-	 * sin(angle) ≈ angle (in normalized form)
-	 * cos(angle) ≈ 1 - angle²/2 (in normalized form)
+	 * sin(x) ≈ x - x³/6  (Taylor series)
+	 * cos(x) ≈ 1 - x²/2 + x⁴/24  (Taylor series)
+	 * 
+	 * For angle_normalized in [-1000, 1000] representing [-π, +π]:
+	 * This gives us full reverse when fully steered
 	 */
-	int dx = (angle_normalized * speed) / 1000;
+	long angle_cubed = ((long)angle_normalized * angle_normalized * angle_normalized) / 1000000;
+	int sin_approx = (angle_normalized * 1000 - angle_cubed / 6) / 1000;
 	
-	/* For dy, we use cos approximation: cos ≈ 1000 - (angle²/2000) */
-	int cos_approx = 1000 - ((angle_normalized * angle_normalized) / 2000);
+	long angle_squared = ((long)angle_normalized * angle_normalized) / 1000;
+	long angle_fourth = (angle_squared * angle_squared) / 1000;
+	int cos_approx = 1000 - angle_squared / 2 + angle_fourth / 24;
+	
+	int dx = (sin_approx * speed) / 1000;
 	int dy = -(cos_approx * speed) / 1000;  /* Negative because forward is -Y */
 	
 	/* Scale down the movement for reasonable mouse speed */
