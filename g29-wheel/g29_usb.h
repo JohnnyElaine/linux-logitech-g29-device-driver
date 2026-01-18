@@ -59,8 +59,8 @@
 #define G29_GEARSHIFT_Z_NEUTRAL 0x9C   /* Neutral position */
 #define G29_GEARSHIFT_Z_PRESSED 0xDC   /* Pressed down */
 
-#define WHEEL_CENTER        32768
-#define WHEEL_MAX_DIST      32768
+#define WHEEL_CENTER        0x8000
+#define WHEEL_MAX_DIST      0x8000
 
 struct g29_state {
 	u32 buttons_le;  /* Button bitmask (little-endian) */

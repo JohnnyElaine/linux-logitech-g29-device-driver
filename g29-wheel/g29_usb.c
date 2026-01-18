@@ -44,7 +44,7 @@ MODULE_PARM_DESC(mode, "Initial mode (0=MEDIA, 1=WASD, 2=MOUSE)");
 /* Steering curve exponent (100 = linear, 200 = squared, 150 = ^1.5)
  * Higher values reduce sensitivity at low steering angles.
  */
-static int steer_curve = 200;
+static int steer_curve = 100;
 module_param(steer_curve, int, 0644);
 MODULE_PARM_DESC(steer_curve, "Steering sensitivity curve (100=linear, 200=squared, default=200)");
 
@@ -134,7 +134,7 @@ static void g29_switch_mode(struct g29_dev *g29, enum g29_mode new_mode) {
 
 	/* Start timers when entering modes */
 	if (new_mode == G29_MODE_WASD) {
-		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(1));
 	}
 	if (new_mode == G29_MODE_MOUSE) {
 		mod_timer(&g29->mouse_timer, jiffies + msecs_to_jiffies(10));
@@ -331,7 +331,7 @@ static void wasd_mode_timer_fn(struct timer_list *t) {
 	input_sync(g29->input);
 
 	if (g29->current_mode == G29_MODE_WASD)
-		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(1));
 }
 
 static void process_media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
