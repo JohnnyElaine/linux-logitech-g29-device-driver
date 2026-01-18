@@ -25,24 +25,11 @@
 #include <linux/jiffies.h>
 #include <linux/hid.h>
 
+#include "g29_usb.h"
+
 MODULE_AUTHOR("LLP group 16");
 MODULE_DESCRIPTION("Logitech G29 USB driver");
 MODULE_LICENSE("GPL");
-
-#define USB_VENDOR_ID_LOGITECH      0x046d
-#define USB_DEVICE_ID_LOGITECH_G29  0xc24f
-#define USB_DEVICE_ID_LOGITECH_G29_ALT 0xc260
-
-#define G29_BTN_PLUS        0x00800000u
-#define G29_BTN_MINUS       0x01000000u
-#define G29_BTN_RED_CW      0x02000000u
-#define G29_BTN_RED_CCW     0x04000000u
-#define G29_BTN_RETURN      0x08000000u
-#define G29_BTN_R1          0x00000100u
-#define G29_BTN_L1          0x00000200u
-
-#define WHEEL_CENTER 32768
-#define WHEEL_MAX_DIST 32768
 
 enum g29_mode {
 	G29_MODE_MEDIA = 0,
@@ -51,17 +38,6 @@ enum g29_mode {
 static int mode = G29_MODE_MEDIA;
 module_param(mode, int, 0444);
 MODULE_PARM_DESC(mode, "Mapping mode (0=MEDIA)");
-
-struct g29_state {
-	u32 buttons_le;
-	u16 rot_le;
-	u8 gas;
-	u8 brk;
-	u8 clt;
-	u8 gr_x;
-	u8 gr_y;
-	u8 gr_z;
-};
 
 struct g29_keymap_edge {
 	u32 mask;
