@@ -52,12 +52,22 @@ static int steer_deadzone = 10;
 module_param(steer_deadzone, int, 0644);
 MODULE_PARM_DESC(steer_deadzone, "Steering deadzone radius from center (default=10)");
 
-struct g29_keymap_edge {
+static int gas_curve = 100;
+module_param(gas_curve, int, 0644);
+MODULE_PARM_DESC(gas_curve, "Gas pedal sensitivity curve (100=linear, 200=squared, default=200)");
+
+static int clutch_curve = 100;
+module_param(clutch_curve, int, 0644);
+MODULE_PARM_DESC(clutch_curve, "Clutch pedal sensitivity curve (100=linear, 200=squared, default=200)");
+
+#define NORMALIZATION_PRECISION 1000
+
+struct g29_keymap {
 	u32 mask;
 	unsigned short keycode;
 };
 
-static const struct g29_keymap_edge g29_media_edge_map[] = {
+static const struct g29_keymap media_mode_keymap[] = {
 	/* Red rotary = volume */
 	{ G29_BTN_RED_CW,  KEY_VOLUMEUP },
 	{ G29_BTN_RED_CCW, KEY_VOLUMEDOWN },
@@ -68,6 +78,13 @@ static const struct g29_keymap_edge g29_media_edge_map[] = {
 	/* Plus/Minus = next/prev */
 	{ G29_BTN_R1,    KEY_NEXTSONG },
 	{ G29_BTN_L1,   KEY_PREVIOUSSONG },
+};
+
+static const struct g29_keymap mouse_mode_keymap[] = {
+	{ G29_BTN_X,      BTN_LEFT },
+	{ G29_BTN_CIRCLE, BTN_RIGHT },
+	{ G29_BTN_TRIANGLE, BTN_MIDDLE },
+	{ G29_BTN_SQUARE, BTN_SIDE },
 };
 
 struct g29_dev {
@@ -85,9 +102,12 @@ struct g29_dev {
 	int endpoint;
 
 	struct timer_list steer_timer;
+	struct timer_list mouse_timer;
 	u32 steer_phase_ms;
 
 	u32 phase_accumulator;
+	u32 gas_phase_accumulator;
+	u32 clutch_phase_accumulator;
 
 	enum g29_mode current_mode;
 	struct g29_state last;
@@ -99,17 +119,25 @@ static void g29_switch_mode(struct g29_dev *g29, enum g29_mode new_mode) {
 	if (g29->current_mode == new_mode)
 		return;
 
-	/* Stop timer when leaving WASD mode */
+	/* Stop timers when leaving modes */
 	if (g29->current_mode == G29_MODE_WASD) {
 		timer_delete_sync(&g29->steer_timer);
 	}
+	if (g29->current_mode == G29_MODE_MOUSE) {
+		timer_delete_sync(&g29->mouse_timer);
+	}
 
 	g29->current_mode = new_mode;
-	g29->phase_accumulator = 0;  /* Reset accumulator */
+	g29->phase_accumulator = 0;
+	g29->gas_phase_accumulator = 0;
+	g29->clutch_phase_accumulator = 0;
 
-	/* Start timer when entering WASD mode */
+	/* Start timers when entering modes */
 	if (new_mode == G29_MODE_WASD) {
 		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
+	}
+	if (new_mode == G29_MODE_MOUSE) {
+		mod_timer(&g29->mouse_timer, jiffies + msecs_to_jiffies(10));
 	}
 
 	dev_info(&g29->udev->dev, "Switched to mode: %s\n",
@@ -117,7 +145,7 @@ static void g29_switch_mode(struct g29_dev *g29, enum g29_mode new_mode) {
 		 new_mode == G29_MODE_WASD ? "WASD" : "MOUSE");
 }
 
-static int calc_adjusted_distance(int distance) {
+static int calc_adjusted_steering_distance(int distance) {
 	/* Apply non-linear steering curve:
 	 * adjusted = (distance / MAX)^(curve/100) * MAX
 	 *
@@ -138,27 +166,105 @@ static int calc_adjusted_distance(int distance) {
 	 * normalized = (distance * 1000) / WHEEL_MAX_DIST
 	 * Apply power approximation, then scale back
 	 */
-	int normalized = (distance * 1000) / WHEEL_MAX_DIST;
+	int normalized = (distance * NORMALIZATION_PRECISION) / WHEEL_MAX_DIST;
 	int powered;
 
 	if (steer_curve == 150) {
 		/* Approximate ^1.5 with (x * sqrt(x)) */
-		int sqrt_norm = int_sqrt(normalized * 1000);
-		powered = (normalized * sqrt_norm) / 1000;
+		int sqrt_norm = int_sqrt(normalized * NORMALIZATION_PRECISION);
+		powered = (normalized * sqrt_norm) / NORMALIZATION_PRECISION;
 	} else {
 		/* Fallback: squared for any other value > 100 */
-		powered = (normalized * normalized) / 1000;
+		powered = (normalized * normalized) / NORMALIZATION_PRECISION;
 	}
 
-	return (powered * WHEEL_MAX_DIST) / 1000;
+	return (powered * WHEEL_MAX_DIST) / NORMALIZATION_PRECISION;
 }
 
-static void g29_steer_timer_fn(struct timer_list *t) {
+static int calc_adjusted_pedal_distance(int pedal_pressure, int curve) {
+	if (curve == 100) {
+		return pedal_pressure;
+	}
+	if (curve == 200) {
+		return (pedal_pressure * pedal_pressure) / G29_PEDAL_RELEASED;
+	}
+
+	int normalized = (pedal_pressure * NORMALIZATION_PRECISION) / G29_PEDAL_RELEASED;
+	int powered;
+
+	if (curve == 150) {
+		int sqrt_norm = int_sqrt(normalized * NORMALIZATION_PRECISION);
+		powered = (normalized * sqrt_norm) / NORMALIZATION_PRECISION;
+	} else {
+		powered = (normalized * normalized) / NORMALIZATION_PRECISION;
+	}
+
+	return (powered * G29_PEDAL_RELEASED) / NORMALIZATION_PRECISION;
+}
+
+static void mouse_mode_timer_fn(struct timer_list *t) {
+	struct g29_dev *g29 = timer_container_of(g29, t, mouse_timer);
+
+	const int rot = le16_to_cpu(g29->last.rot_le);
+	int gas_pressure = G29_PEDAL_RELEASED - g29->last.gas;
+	int clutch_pressure = G29_PEDAL_RELEASED - g29->last.clt;
+	
+	/* Calculate speed: positive for forward (gas), negative for backward (clutch) */
+	int speed = gas_pressure - clutch_pressure;
+	
+	/* Apply deadzone to steering */
+	int effective_rot = rot;
+	if (abs(rot - WHEEL_CENTER) <= steer_deadzone) {
+		effective_rot = WHEEL_CENTER;
+	}
+	
+	/* Calculate angle from wheel rotation
+	 * Map wheel rotation to angle: 
+	 * - Center (32768) = 0° (straight up when forward)
+	 * - Full left (0) = -90° (left)
+	 * - Full right (65535) = +90° (right)
+	 * We normalize to -1000 to +1000 for integer math
+	 */
+	int angle_normalized = ((effective_rot - WHEEL_CENTER) * 1000) / WHEEL_CENTER;
+	
+	/* Clamp angle to prevent overflow */
+	if (angle_normalized > 1000) angle_normalized = 1000;
+	if (angle_normalized < -1000) angle_normalized = -1000;
+	
+	/* Calculate movement components:
+	 * dx = sin(angle) * speed
+	 * dy = cos(angle) * speed
+	 * 
+	 * For small angles we approximate:
+	 * sin(angle) ≈ angle (in normalized form)
+	 * cos(angle) ≈ 1 - angle²/2 (in normalized form)
+	 */
+	int dx = (angle_normalized * speed) / 1000;
+	
+	/* For dy, we use cos approximation: cos ≈ 1000 - (angle²/2000) */
+	int cos_approx = 1000 - ((angle_normalized * angle_normalized) / 2000);
+	int dy = -(cos_approx * speed) / 1000;  /* Negative because forward is -Y */
+	
+	/* Scale down the movement for reasonable mouse speed */
+	int scaled_dx = dx / 50;
+	int scaled_dy = dy / 50;
+	
+	/* Report mouse movement if there's any */
+	if (scaled_dx != 0 || scaled_dy != 0) {
+		input_report_rel(g29->input, REL_X, scaled_dx);
+		input_report_rel(g29->input, REL_Y, scaled_dy);
+		input_sync(g29->input);
+	}
+	
+	/* Reschedule timer if still in mouse mode */
+	if (g29->current_mode == G29_MODE_MOUSE)
+		mod_timer(&g29->mouse_timer, jiffies + msecs_to_jiffies(10));
+}
+static void wasd_mode_timer_fn(struct timer_list *t) {
 	struct g29_dev *g29 = timer_container_of(g29, t, steer_timer);
 
 	const int rot = le16_to_cpu(g29->last.rot_le);
 	
-	/* Apply deadzone */
 	int effective_rot = rot;
 	int distance_from_center = abs(rot - WHEEL_CENTER);
 	if (distance_from_center <= steer_deadzone) {
@@ -166,7 +272,7 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 	}
 	
 	int distance_to_center = abs(effective_rot - WHEEL_CENTER);
-	int adjusted_distance = calc_adjusted_distance(distance_to_center);
+	int adjusted_distance = calc_adjusted_steering_distance(distance_to_center);
 
 	/* Phase accumulator approach:
 	 * Accumulate the adjusted distance on each tick.
@@ -191,8 +297,30 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 	input_report_key(g29->input, KEY_A, press_key && (effective_rot < WHEEL_CENTER));
 	input_report_key(g29->input, KEY_D, press_key && (effective_rot >= WHEEL_CENTER));
 
-	input_report_key(g29->input, KEY_W, g29->last.gas <= 0x80);
-	input_report_key(g29->input, KEY_S, g29->last.clt <= 0x80);
+	/* Gas pedal (0xFF=up, 0x00=down) -> W key */
+	int gas_pressure = 0xFF - g29->last.gas;
+	int gas_adjusted = calc_adjusted_pedal_distance(gas_pressure, gas_curve);
+	g29->gas_phase_accumulator += gas_adjusted;
+
+	bool press_w = false;
+	if (g29->gas_phase_accumulator >= G29_PEDAL_RELEASED) {
+		g29->gas_phase_accumulator -= G29_PEDAL_RELEASED;
+		press_w = true;
+	}
+
+	/* Clutch pedal (0xFF=up, 0x00=down) -> S key */
+	int clutch_pressure = 0xFF - g29->last.clt;
+	int clutch_adjusted = calc_adjusted_pedal_distance(clutch_pressure, clutch_curve);
+	g29->clutch_phase_accumulator += clutch_adjusted;
+
+	bool press_s = false;
+	if (g29->clutch_phase_accumulator >= G29_PEDAL_RELEASED) {
+		g29->clutch_phase_accumulator -= G29_PEDAL_RELEASED;
+		press_s = true;
+	}
+
+	input_report_key(g29->input, KEY_W, press_w);
+	input_report_key(g29->input, KEY_S, press_s);
 
 	input_sync(g29->input);
 
@@ -200,64 +328,46 @@ static void g29_steer_timer_fn(struct timer_list *t) {
 		mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(2));
 }
 
-static void media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
-	u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
-	for (int i = 0; i < ARRAY_SIZE(g29_media_edge_map); i++) {
-		const struct g29_keymap_edge *e = &g29_media_edge_map[i];
-		if (pressed & e->mask) {
-			input_report_key(g29->input, e->keycode, 1);
-			input_report_key(g29->input, e->keycode, 0);
+static void process_media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+	const u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
+	const u32 released = le32_to_cpu(~cur->buttons_le & prev->buttons_le);
+	for (int i = 0; i < ARRAY_SIZE(media_mode_keymap); i++) {
+		const struct g29_keymap *k = &media_mode_keymap[i];
+		if (pressed & k->mask) {
+			input_report_key(g29->input, k->keycode, 1);
+		}
+		if (released & k->mask) {
+			input_report_key(g29->input, k->keycode, 0);
 		}
 	}
 	input_sync(g29->input);
 }
 
-static void wasd_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+static void process_wasd_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
 	/* WASD mode is handled by the timer function (g29_steer_timer_fn) */
 	/* No additional processing needed here */
 }
 
-static void mouse_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
-	/* Translate wheel rotation to mouse X movement */
-	int rot = le16_to_cpu(cur->rot_le);
-	int prev_rot = le16_to_cpu(prev->rot_le);
-	
-	/* Apply deadzone to both current and previous */
-	if (abs(rot - WHEEL_CENTER) <= steer_deadzone) {
-		rot = WHEEL_CENTER;
+static void process_mouse_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+	const u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
+	const u32 released = le32_to_cpu(~cur->buttons_le & prev->buttons_le);
+
+	for (int i = 0; i < ARRAY_SIZE(mouse_mode_keymap); i++) {
+		const struct g29_keymap *k = &mouse_mode_keymap[i];
+		if (pressed & k->mask) {
+			input_report_key(g29->input, k->keycode, 1);
+		}
+		if (released & k->mask) {
+			input_report_key(g29->input, k->keycode, 0);
+		}
 	}
-	if (abs(prev_rot - WHEEL_CENTER) <= steer_deadzone) {
-		prev_rot = WHEEL_CENTER;
-	}
-	
-	int delta = rot - prev_rot;
-	
-	/* Handle wrap-around (0xFFFF -> 0x0000 or vice versa) */
-	if (delta > 32768)
-		delta -= 65536;
-	else if (delta < -32768)
-		delta += 65536;
-	
-	/* Scale movement (adjust sensitivity) */
-	if (delta != 0) {
-		input_report_rel(g29->input, REL_X, delta / 100);
-	}
-	
-	/* Gas pedal -> scroll up, Brake pedal -> scroll down */
-	if (cur->gas < 0x80 && prev->gas >= 0x80) {
+
+	if (pressed & G29_BTN_RED_CW) {
 		input_report_rel(g29->input, REL_WHEEL, 1);
 	}
-	if (cur->brk < 0x80 && prev->brk >= 0x80) {
+	if (pressed & G29_BTN_RED_CCW) {
 		input_report_rel(g29->input, REL_WHEEL, -1);
 	}
-	
-	/* Map buttons to mouse buttons */
-	u32 cur_buttons = le32_to_cpu(cur->buttons_le);
-	u32 prev_buttons = le32_to_cpu(prev->buttons_le);
-	
-	input_report_key(g29->input, BTN_LEFT, cur_buttons & G29_BTN_X);
-	input_report_key(g29->input, BTN_RIGHT, cur_buttons & G29_BTN_CIRCLE);
-	input_report_key(g29->input, BTN_MIDDLE, cur_buttons & G29_BTN_SQUARE);
 	
 	input_sync(g29->input);
 }
@@ -283,13 +393,13 @@ static void g29_process_report(struct g29_dev *g29, const u8 *data, unsigned int
 	
 	switch (g29->current_mode) {
 		case G29_MODE_MEDIA:
-			media_mode(g29, cur, &g29->last);
+			process_media_mode(g29, cur, &g29->last);
 			break;
 		case G29_MODE_WASD:
-			wasd_mode(g29, cur, &g29->last);
+			process_wasd_mode(g29, cur, &g29->last);
 			break;
 		case G29_MODE_MOUSE:
-			mouse_mode(g29, cur, &g29->last);
+			process_mouse_mode(g29, cur, &g29->last);
 			break;
 	}
 
@@ -336,6 +446,8 @@ static void g29_input_close(struct input_dev *input) {
 	
 	if (g29->current_mode == G29_MODE_WASD)
 		timer_delete_sync(&g29->steer_timer);
+	if (g29->current_mode == G29_MODE_MOUSE)
+		timer_delete_sync(&g29->mouse_timer);
 	
 	usb_kill_urb(g29->urb);
 }
@@ -378,7 +490,8 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	memset(&g29->last, 0, sizeof(g29->last));
 	g29->current_mode = mode;  /* Initialize to module parameter */
 
-	timer_setup(&g29->steer_timer, g29_steer_timer_fn, 0);
+	timer_setup(&g29->steer_timer, wasd_mode_timer_fn, 0);
+	timer_setup(&g29->mouse_timer, mouse_mode_timer_fn, 0);
 
 	if ((g29->buf = usb_alloc_coherent(udev, g29->maxp, GFP_KERNEL, &g29->buf_dma)) == NULL) {
 		ret = -ENOMEM;
