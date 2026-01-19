@@ -41,24 +41,9 @@ static int mode = G29_MODE_MEDIA;
 module_param(mode, int, 0644);
 MODULE_PARM_DESC(mode, "Initial mode (0=MEDIA, 1=WASD, 2=MOUSE)");
 
-/* Steering curve exponent (100 = linear, 200 = squared, 150 = ^1.5)
- * Higher values reduce sensitivity at low steering angles.
- */
-static int steer_curve = 100;
-module_param(steer_curve, int, 0644);
-MODULE_PARM_DESC(steer_curve, "Steering sensitivity curve (100=linear, 200=squared, default=200)");
-
 static int steer_deadzone = 10;
 module_param(steer_deadzone, int, 0644);
 MODULE_PARM_DESC(steer_deadzone, "Steering deadzone radius from center (default=10)");
-
-static int gas_curve = 100;
-module_param(gas_curve, int, 0644);
-MODULE_PARM_DESC(gas_curve, "Gas pedal sensitivity curve (100=linear, 200=squared, default=200)");
-
-static int clutch_curve = 100;
-module_param(clutch_curve, int, 0644);
-MODULE_PARM_DESC(clutch_curve, "Clutch pedal sensitivity curve (100=linear, 200=squared, default=200)");
 
 #define NORMALIZATION_PRECISION 1000
 
@@ -92,6 +77,7 @@ struct g29_dev {
     char phys[64];
 
     struct usb_device *udev;
+	struct usb_interface *intf;
     struct input_dev *input;
 
     struct urb *urb;
@@ -109,10 +95,110 @@ struct g29_dev {
     u32 gas_phase_accumulator;
     u32 clutch_phase_accumulator;
 
+    struct work_struct autocenter_work;
+    int out_ep_addr;
+    int out_ep_maxp;
+    int out_ep_interval;
+
     enum g29_mode current_mode;
     struct g29_state last;
 };
 
+
+static void g29_find_int_out_ep(struct g29_dev *g29) {
+    const struct usb_host_interface *alts = g29->intf->cur_altsetting;
+
+    g29->out_ep_addr = 0;
+    g29->out_ep_maxp = 0;
+    g29->out_ep_interval = 0;
+    for (int i = 0; i < alts->desc.bNumEndpoints; i++) {
+        const struct usb_endpoint_descriptor *d = &alts->endpoint[i].desc;
+        if (!usb_endpoint_is_int_out(d))
+            continue;
+        g29->out_ep_addr = d->bEndpointAddress;
+        g29->out_ep_maxp = usb_endpoint_maxp(d);
+        g29->out_ep_interval = d->bInterval;
+        dev_info(&g29->intf->dev, "Found interrupt OUT ep=%02x maxp=%d interval=%d\n", g29->out_ep_addr, g29->out_ep_maxp, g29->out_ep_interval);
+        return;
+    }
+
+    dev_info(&g29->intf->dev, "No interrupt OUT endpoint found on this interface (will use SET_REPORT)\n");
+}
+
+static int g29_send_interrupt_out(struct g29_dev *g29, const u8 *buf, int len) {
+    int ret, actual = 0;
+
+    if (!g29->out_ep_addr)
+        return -ENODEV;
+
+    ret = usb_interrupt_msg(g29->udev,
+                            usb_sndintpipe(g29->udev, g29->out_ep_addr),
+                            (void *) buf, len, &actual, 1000);
+    if (ret < 0)
+        return ret;
+    if (actual != len)
+        return -EIO;
+    return 0;
+}
+
+static int g29_send_set_report(const struct g29_dev *g29, const int ifnum, const int report_id, const u8 *buf, const int len) {
+    const u16 wValue = ((u16) 0x02 << 8) | (report_id & 0xff);
+    const int ret = usb_control_msg(g29->udev, usb_sndctrlpipe(g29->udev, 0), 0x09,
+        USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_OUT,
+        wValue, ifnum, (void *) buf, len, USB_CTRL_SET_TIMEOUT);
+    if (ret < 0)
+        return ret;
+    if (ret != len)
+        return -EIO;
+    return 0;
+}
+
+static int g29_send_cmd7(struct g29_dev *g29, const u8 cmd0, const u8 cmd1, const u8 cmd2, const u8 cmd3, const u8 cmd4, const u8 cmd5, const u8 cmd6) {
+    const u8 cmd[] = {cmd0, cmd1, cmd2, cmd3, cmd4, cmd5, cmd6};
+    int ret;
+    if ((ret = g29_send_interrupt_out(g29, cmd, 7)) == 0)
+        return 0;
+
+    const int ifnum = 0, report_id = 0;
+    if ((ret = g29_send_set_report(g29, ifnum, report_id, cmd, 7)) < 0) {
+        dev_warn(&g29->intf->dev,
+                 "autocenter cmd %02x %02x %02x %02x %02x %02x %02x failed: %d (ifnum=%d report_id=%d out_ep=%02x)\n",
+                 cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6],
+                 ret, ifnum, report_id, g29->out_ep_addr);
+    }
+    return ret;
+}
+
+static void g29_set_autocenter_default(struct g29_dev *g29, const u16 magnitude) {
+    if (magnitude == 0) {
+        g29_send_cmd7(g29, 0xf5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+        return;
+    }
+
+    u32 expand_a, expand_b;
+    if (magnitude <= 0xaaaa) {
+        expand_a = 0x0c * magnitude;
+        expand_b = 0x80 * magnitude;
+    } else {
+        expand_a = (0x0c * 0xaaaa) + 0x06 * (magnitude - 0xaaaa);
+        expand_b = (0x80 * 0xaaaa) + 0xff * (magnitude - 0xaaaa);
+    }
+    expand_a >>= 1;
+
+    if (g29_send_cmd7(g29, 0xfe, 0x0d, expand_a / 0xaaaa, expand_a / 0xaaaa, expand_b / 0xaaaa, 0x00, 0x00) < 0)
+        return;
+
+    g29_send_cmd7(g29, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+}
+
+static void g29_autocenter_work_fn(struct work_struct *work) {
+    struct g29_dev *g29 = container_of(work, struct g29_dev, autocenter_work);
+    const u16 mag = 0x8000;
+    if (mag == 0)
+        return;
+
+    g29_set_autocenter_default(g29, mag);
+}
 
 static void g29_switch_mode(struct g29_dev *g29, enum g29_mode new_mode) {
     if (g29->current_mode == new_mode)
@@ -224,7 +310,7 @@ static void wasd_mode_timer_fn(struct timer_list *t) {
 
     input_report_key(g29->input, KEY_S, brk >= 0x80);
 
-    if (rot >= 0x7ff8 && rot <= 0x8008){
+    if (rot >= 0x7ff8 && rot <= 0x8008) {
         input_report_key(g29->input, KEY_A, 0);
         input_report_key(g29->input, KEY_D, 0);
     } else {
@@ -351,6 +437,7 @@ static int g29_input_open(struct input_dev *input) {
         return -EIO;
 
     g29_switch_mode(g29, mode);
+    schedule_work(&g29->autocenter_work);
 
     return 0;
 }
@@ -363,6 +450,7 @@ static void g29_input_close(struct input_dev *input) {
     if (g29->current_mode == G29_MODE_MOUSE)
         timer_delete_sync(&g29->mouse_timer);
 
+    cancel_work_sync(&g29->autocenter_work);
     usb_kill_urb(g29->urb);
 }
 
@@ -396,6 +484,7 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
     }
 
     g29->udev = udev;
+    g29->intf = intf;
     g29->input = input;
 
     g29->endpoint = usb_endpoint_num(ep);
@@ -437,6 +526,9 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
     input->phys = g29->phys;
     usb_to_input_id(udev, &input->id);
     input->dev.parent = &intf->dev;
+
+    g29_find_int_out_ep(g29);
+    INIT_WORK(&g29->autocenter_work, g29_autocenter_work_fn);
 
     __set_bit(EV_KEY, input->evbit);
     __set_bit(EV_REL, input->evbit);
@@ -503,6 +595,8 @@ static void g29_disconnect(struct usb_interface *intf) {
     struct g29_dev *g29 = usb_get_intfdata(intf);
     usb_set_intfdata(intf, NULL);
     if (!g29) return;
+    timer_delete_sync(&g29->steer_timer);
+    cancel_work_sync(&g29->autocenter_work);
     usb_kill_urb(g29->urb);
     input_unregister_device(g29->input);
     usb_free_urb(g29->urb);
