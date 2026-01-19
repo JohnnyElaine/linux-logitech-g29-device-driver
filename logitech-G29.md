@@ -45,7 +45,8 @@ Logitech G29 USB Protocol
     - `0x02000000` - Red rotation clockwise
     - `0x04000000` - Red rotation counterclockwise
     - `0x08000000` - Return
-    - `0xF0000000` - Playstation 3 Logo Button (verify)
+    - `0x10000000` - PS3 Logo
+    - `0xE0000000` - ?
 - `Rot`: Wheel rotation (little-endian). `0x0000` (leftmost) - `0xFFFF` (rightmost).
 - `Gas`: Gas pedal. `0xFF` (up, default) - `0x00` (down).
 - `Brk`: Brake pedal. `0xFF` (up, default) - `0x00` (down).

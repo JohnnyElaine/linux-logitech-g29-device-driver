@@ -1,5 +1,6 @@
-# Device Drivers
-----------------------------------
+
+Device Driver
+=============
 
 This repository contains Linux **kernel modules** (``.ko``) that implement low-level USB input drivers and expose device events through the Linux **input subsystem** (evdev).
 
@@ -9,7 +10,6 @@ A helper tool (``usb_driver_manager.py``) is included to make it easier to:
 - unbind/bind a selected interface to a chosen driver during development
 
 ## Drivers
-----------
 
 ### Mouse driver (``mouse/``)
 USB HID boot-protocol mouse driver.
@@ -37,7 +37,6 @@ make
 After building, the module (``*.ko``) is typically placed under ``build/`` by the provided Makefiles.
 
 ## USB Driver Manager
----------------------
 
 **Usage examples:**
 ```bash
@@ -55,7 +54,7 @@ sudo python3 usb_driver_manager.py ./mouse/build ./g29_media_usb/build
 4. Confirm; the tool unbinds the current driver, reloads the module if needed, and binds the chosen interface.
 
 ## Testing
-----------
+
 After binding the driver, use ``evtest`` to confirm key events:
 ```bash
 sudo evtest

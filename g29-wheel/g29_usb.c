@@ -245,7 +245,7 @@ static void wasd_mode_timer_fn(struct timer_list *t) {
         mod_timer(&g29->steer_timer, jiffies + msecs_to_jiffies(1));
 }
 
-static void process_media_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+static void process_media_mode(const struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
     const u32 buttons = le32_to_cpu(cur->buttons_le);
     for (int i = 0; i < ARRAY_SIZE(media_mode_keymap); i++) {
         const struct g29_keymap *k = &media_mode_keymap[i];
@@ -254,7 +254,7 @@ static void process_media_mode(struct g29_dev *g29, const struct g29_state *cur,
     input_sync(g29->input);
 }
 
-static void process_wasd_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+static void process_wasd_mode(const struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
     // WASD mode is handled by the timer function (g29_steer_timer_fn)
     const u32 buttons = le32_to_cpu(cur->buttons_le);
     input_report_key(g29->input, KEY_C, !!(buttons & G29_BTN_L1));
@@ -262,10 +262,10 @@ static void process_wasd_mode(struct g29_dev *g29, const struct g29_state *cur, 
     input_sync(g29->input);
 }
 
-static void process_mouse_mode(struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
+static void process_mouse_mode(const struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
     const u32 buttons = le32_to_cpu(cur->buttons_le);
     const u32 pressed = le32_to_cpu(cur->buttons_le & ~prev->buttons_le);
-    const u32 released = le32_to_cpu(~cur->buttons_le & prev->buttons_le);
+    //const u32 released = le32_to_cpu(~cur->buttons_le & prev->buttons_le);
 
     for (int i = 0; i < ARRAY_SIZE(mouse_mode_keymap); i++) {
         const struct g29_keymap *k = &mouse_mode_keymap[i];
@@ -289,28 +289,20 @@ static void g29_check_mode_switch(struct g29_dev *g29, const struct g29_state *c
         g29_switch_mode(g29, G29_MODE_MEDIA);
     } else if (pressed & G29_BTN_OPTION) {
         g29_switch_mode(g29, G29_MODE_WASD);
-    } else if (pressed & G29_BTN_PS3_LOGO) {
+    } else if (pressed & G29_BTN_PS3) {
         g29_switch_mode(g29, G29_MODE_MOUSE);
     }
 }
 
-static void g29_process_report(struct g29_dev *g29, const u8 *data, unsigned int len) {
+static void g29_process_report(struct g29_dev *g29, const u8 *data, const unsigned int len) {
     if (len < 12) return;
-
-    struct g29_state *cur = (void *) data;
+    const struct g29_state *cur = (void *) data;
 
     g29_check_mode_switch(g29, cur, &g29->last);
-
     switch (g29->current_mode) {
-        case G29_MODE_MEDIA:
-            process_media_mode(g29, cur, &g29->last);
-            break;
-        case G29_MODE_WASD:
-            process_wasd_mode(g29, cur, &g29->last);
-            break;
-        case G29_MODE_MOUSE:
-            process_mouse_mode(g29, cur, &g29->last);
-            break;
+        case G29_MODE_MEDIA: process_media_mode(g29, cur, &g29->last); break;
+        case G29_MODE_WASD: process_wasd_mode(g29, cur, &g29->last); break;
+        case G29_MODE_MOUSE: process_mouse_mode(g29, cur, &g29->last);break;
     }
 
     g29->last = *cur;
