@@ -66,10 +66,9 @@ static const struct g29_keymap media_mode_keymap[] = {
 };
 
 static const struct g29_keymap mouse_mode_keymap[] = {
-    {G29_BTN_X, BTN_LEFT},
-    {G29_BTN_CIRCLE, BTN_RIGHT},
-    {G29_BTN_TRIANGLE, BTN_MIDDLE},
-    {G29_BTN_SQUARE, BTN_SIDE},
+    {G29_BTN_L1, BTN_LEFT},
+    {G29_BTN_R1, BTN_RIGHT},
+    {G29_BTN_RETURN, BTN_MIDDLE},
 };
 
 struct g29_dev {
@@ -234,63 +233,20 @@ static void mouse_mode_timer_fn(struct timer_list *t) {
     struct g29_dev *g29 = timer_container_of(g29, t, mouse_timer);
 
     const int rot = le16_to_cpu(g29->last.rot_le);
-    int gas_pressure = G29_PEDAL_RELEASED - g29->last.gas;
-    int clutch_pressure = G29_PEDAL_RELEASED - g29->last.clt;
+    const int up = G29_PEDAL_RELEASED - g29->last.gas;
+    const int down = G29_PEDAL_RELEASED - g29->last.clt;
+    const int left = rot < 0x8000 ? WHEEL_CENTER - rot : 0;
+    const int right = rot > 0x8000 ? rot - WHEEL_CENTER : 0;
 
-    /* Calculate speed: positive for forward (gas), negative for backward (clutch) */
-    int speed = gas_pressure - clutch_pressure;
+    const int dx = (right - left) / 0x400;
+    const int dy = (down - up) / 0x20;
 
-    /* Apply deadzone to steering */
-    int effective_rot = rot;
-    if (abs(rot - WHEEL_CENTER) <= steer_deadzone) {
-        effective_rot = WHEEL_CENTER;
-    }
-
-    /* Calculate angle from wheel rotation
-     * Map wheel rotation to angle:
-     * - Center (32768) = 0° (straight forward)
-     * - Full left (0) = -180° (reverse)
-     * - Full right (65535) = +180° (reverse)
-     * We normalize to -1000 to +1000 representing -π to +π radians
-     */
-    int angle_normalized = ((effective_rot - WHEEL_CENTER) * 1000) / WHEEL_CENTER;
-
-    /* Clamp angle to prevent overflow */
-    if (angle_normalized > 1000) angle_normalized = 1000;
-    if (angle_normalized < -1000) angle_normalized = -1000;
-
-    /* Calculate movement components using better trigonometric approximations:
-     * dx = sin(angle) * speed
-     * dy = cos(angle) * speed
-     *
-     * sin(x) ≈ x - x³/6  (Taylor series)
-     * cos(x) ≈ 1 - x²/2 + x⁴/24  (Taylor series)
-     *
-     * For angle_normalized in [-1000, 1000] representing [-π, +π]:
-     * This gives us full reverse when fully steered
-     */
-    long angle_cubed = ((long) angle_normalized * angle_normalized * angle_normalized) / 1000000;
-    int sin_approx = (angle_normalized * 1000 - angle_cubed / 6) / 1000;
-
-    long angle_squared = ((long) angle_normalized * angle_normalized) / 1000;
-    long angle_fourth = (angle_squared * angle_squared) / 1000;
-    int cos_approx = 1000 - angle_squared / 2 + angle_fourth / 24;
-
-    int dx = (sin_approx * speed) / 1000;
-    int dy = -(cos_approx * speed) / 1000; /* Negative because forward is -Y */
-
-    /* Scale down the movement for reasonable mouse speed */
-    int scaled_dx = dx / 50;
-    int scaled_dy = dy / 50;
-
-    /* Report mouse movement if there's any */
-    if (scaled_dx != 0 || scaled_dy != 0) {
-        input_report_rel(g29->input, REL_X, scaled_dx);
-        input_report_rel(g29->input, REL_Y, scaled_dy);
+    if (dx != 0 || dy != 0) {
+        input_report_rel(g29->input, REL_X, dx);
+        input_report_rel(g29->input, REL_Y, dy);
         input_sync(g29->input);
     }
 
-    /* Reschedule timer if still in mouse mode */
     if (g29->current_mode == G29_MODE_MOUSE)
         mod_timer(&g29->mouse_timer, jiffies + msecs_to_jiffies(10));
 }
@@ -300,8 +256,8 @@ static void wasd_mode_timer_fn(struct timer_list *t) {
 
     const int period = 50;
     const int rot = le16_to_cpu(g29->last.rot_le);
-    const int gas = 0xFF - g29->last.gas;
-    const int brk = 0xFF - g29->last.brk;
+    const int gas = G29_PEDAL_RELEASED - g29->last.gas;
+    const int brk = G29_PEDAL_RELEASED - g29->last.brk;
 
     const int gas_duty = gas * period / 0x40;
     input_report_key(g29->input, KEY_W, g29->gas_phase_accumulator < gas_duty);
