@@ -192,7 +192,7 @@ static void g29_set_autocenter_default(struct g29_dev *g29, const u16 magnitude)
 
 static void g29_autocenter_work_fn(struct work_struct *work) {
     struct g29_dev *g29 = container_of(work, struct g29_dev, autocenter_work);
-    const u16 mag = 0x8000;
+    const u16 mag = 0xFFFF;
     if (mag == 0)
         return;
 
