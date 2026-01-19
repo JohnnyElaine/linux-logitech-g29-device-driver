@@ -264,16 +264,16 @@ static void wasd_mode_timer_fn(struct timer_list *t) {
     g29->gas_phase_accumulator++;
     g29->gas_phase_accumulator %= period;
 
-    input_report_key(g29->input, KEY_S, brk >= 0x80);
+    input_report_key(g29->input, KEY_S, brk >= G29_PEDAL_THRESHOLD);
 
     if (rot >= 0x7ff8 && rot <= 0x8008) {
         input_report_key(g29->input, KEY_A, 0);
         input_report_key(g29->input, KEY_D, 0);
     } else {
-        const int mag = rot < 0x8000 ? 0x8000 - rot : rot - 0x8000;
+        const int mag = rot < WHEEL_CENTER ? WHEEL_CENTER - rot : rot - WHEEL_CENTER;
         const int duty = mag * period / 0x3000;
-        const int k1 = rot > 0x8000 ? KEY_D : KEY_A;
-        const int k2 = rot > 0x8000 ? KEY_A : KEY_D;
+        const int k1 = rot > WHEEL_CENTER ? KEY_D : KEY_A;
+        const int k2 = rot > WHEEL_CENTER ? KEY_A : KEY_D;
         input_report_key(g29->input, k2, 0);
         input_report_key(g29->input, k1, g29->phase_accumulator < duty);
     }
