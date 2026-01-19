@@ -257,8 +257,20 @@ static void process_media_mode(const struct g29_dev *g29, const struct g29_state
 static void process_wasd_mode(const struct g29_dev *g29, const struct g29_state *cur, const struct g29_state *prev) {
     // WASD mode is handled by the timer function (g29_steer_timer_fn)
     const u32 buttons = le32_to_cpu(cur->buttons_le);
+
     input_report_key(g29->input, KEY_C, !!(buttons & G29_BTN_L1));
     input_report_key(g29->input, KEY_SPACE, !!(buttons & G29_BTN_R1));
+    input_report_key(g29->input, KEY_ENTER, !!(buttons & G29_BTN_RETURN));
+    input_report_key(g29->input, KEY_M, !!(buttons & G29_BTN_CIRCLE));
+
+    if (buttons & G29_BTN_RED_CW) {
+        input_report_rel(g29->input, REL_WHEEL, 1);
+    } else if (buttons & G29_BTN_RED_CCW) {
+        input_report_rel(g29->input, REL_WHEEL, -1);
+    } else {
+        input_report_rel(g29->input, REL_WHEEL, 0);
+    }
+
     input_sync(g29->input);
 }
 
@@ -443,6 +455,8 @@ static int g29_probe(struct usb_interface *intf, const struct usb_device_id *id)
     input_set_capability(input, EV_KEY, KEY_D);
     input_set_capability(input, EV_KEY, KEY_C);
     input_set_capability(input, EV_KEY, KEY_SPACE);
+    input_set_capability(input, EV_KEY, KEY_ENTER);
+    input_set_capability(input, EV_KEY, KEY_M);
 
     // Mouse mode capabilities
     input_set_capability(input, EV_KEY, BTN_LEFT);
